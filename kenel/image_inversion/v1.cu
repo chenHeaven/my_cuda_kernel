@@ -1,3 +1,5 @@
+//图像颜色反转，image输入时A、B、G、R，A时透明度，A不变，其余颜色取反，或者是减去255
+
 #include <cuda_runtime.h>
 #include "../common.h"
 #include <cstdio>

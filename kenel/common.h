@@ -1,8 +1,10 @@
+//通用运算函数
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-// #include <cublasLt.h>
+#include <cublasLt.h>
 #include <float.h>
 #include <cmath>
 #include <chrono>

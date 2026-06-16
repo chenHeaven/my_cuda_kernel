@@ -1,33 +1,38 @@
+//矩阵乘法
+
 
 #include <iostream>
 #include "../common.h"
 #include <fstream>
-#define OFFSET(row, col, n) (row * n + col)
+#include <cublas_v2.h>
+
+
+#define OFFSET(row, col, n) ((row) * (n) + (col))
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void matmul_v1(int M, int N, int K, const float* A, float* B, float* C,float alpha, float beta) {
+__global__ void matmul_v1(int M, int N, int K, const float* A, const float* B, float* C,float alpha, float beta) {
     int bx = blockIdx.x;
     int by = blockIdx.y;
-    int block_row_thread = BN / TN;
-    int block_col_thread = BM / TM;
-    int block_num_tread = block_row_thread * block_col_thread;
+    constexpr int block_row_thread = BN / TN;
+    constexpr int block_col_thread = BM / TM;
+    constexpr int block_num_tread = block_row_thread * block_col_thread;
 
     int tx = (threadIdx.x % block_row_thread) * TN;
     int ty = (threadIdx.x / block_row_thread) * TM;
 
-    const int ldg_a_num = BM * BK / block_num_tread / 4;      //每个线程处理多少个float4
-    const int ldg_b_num = BN * BK / block_num_tread / 4;
+    constexpr int ldg_a_num = BM * BK / block_num_tread / 4;      //每个线程处理多少个float4
+    constexpr int ldg_b_num = BN * BK / block_num_tread / 4;
 
-    int a_tile_row = threadIdx.x / BK * 4;              //当前线程负责的 K 维度起始行
+    int a_tile_row = threadIdx.x / (BK / 4);
     int a_tile_col = threadIdx.x % (BK / 4) * 4;
-    int a_tile_stride = BM / ldg_a_num;                  //在BM维度的每个线程需要的偏移
+    constexpr int a_tile_stride = BM / ldg_a_num;                  //在BM维度的每个线程需要的偏移
 
     __shared__ float a_shared[BM * BK];
     __shared__ float b_shared[BK * BN];
 
-    int b_tile_row = threadIdx.x / BN * 4;
+    int b_tile_row = threadIdx.x / (BN / 4);
     int b_tile_col = threadIdx.x % (BN / 4) * 4;
-    int b_tile_stride = BK / ldg_b_num;
+    constexpr int b_tile_stride = BK / ldg_b_num;
 
     float ldg_a_reg[4 * ldg_a_num] = {0.f};
     float sum[TM][TN] = {0.};
@@ -39,15 +44,16 @@ __global__ void matmul_v1(int M, int N, int K, const float* A, float* B, float* 
 
     for (int k = 0; k < K; k += BK) {
         for (int i = 0; i < BM; i += a_tile_stride) {
-            float index = i / a_tile_stride * 4;
-            FLOAT4(ldg_a_reg[index]) = FLOAT4(A[OFFSET(i + a_tile_row, a_tile_col, K)]);
+            int index = i / a_tile_stride * 4;
+            FLOAT4(ldg_a_reg[index]) = reinterpret_cast<const float4*>(&A[OFFSET(i + a_tile_row, a_tile_col, K)])[0];
             a_shared[OFFSET(a_tile_col, i + a_tile_row, BM)] = ldg_a_reg[index];
             a_shared[OFFSET(a_tile_col + 1, i + a_tile_row, BM)] = ldg_a_reg[index + 1];
             a_shared[OFFSET(a_tile_col + 2, i + a_tile_row, BM)] = ldg_a_reg[index + 2];
             a_shared[OFFSET(a_tile_col + 3, i + a_tile_row, BM)] = ldg_a_reg[index + 3];
         }
         for (int j = 0; j < BK; j += b_tile_stride) {
-            FLOAT4(b_shared[OFFSET(j + b_tile_row, b_tile_col, BN)]) = FLOAT4(B[OFFSET(j + b_tile_row, b_tile_col, N)]);
+            FLOAT4(b_shared[OFFSET(j + b_tile_row, b_tile_col, BN)]) =
+                reinterpret_cast<const float4*>(&B[OFFSET(j + b_tile_row, b_tile_col, N)])[0];
         }
         __syncthreads();
         A += BK;
@@ -65,14 +71,15 @@ __global__ void matmul_v1(int M, int N, int K, const float* A, float* B, float* 
                 }
             }
         }
+        __syncthreads();
     }
     for (int m = 0; m < TM; m++) {
         for (int n = 0; n < TN; n += 4) {
             float4 cmpt = FLOAT4(C[OFFSET(ty + m, tx + n, N)]);
             cmpt.x = alpha * sum[m][n] + beta * cmpt.x;
-            cmpt.y = alpha * sum[m][n] + beta * cmpt.y;
-            cmpt.z = alpha * sum[m][n] + beta * cmpt.z;
-            cmpt.w = alpha * sum[m][n] + beta * cmpt.w;
+            cmpt.y = alpha * sum[m][n + 1] + beta * cmpt.y;
+            cmpt.z = alpha * sum[m][n + 2] + beta * cmpt.z;
+            cmpt.w = alpha * sum[m][n + 3] + beta * cmpt.w;
             FLOAT4(C[OFFSET(ty + m, tx + n, N)]) = cmpt;
         }
     }
@@ -121,14 +128,20 @@ int main() {
       cublasCheck(cublasCreate(&handle));
       float alpha = 1.0f;
       float beta = 0.0f;
-      float cublas_time = benchmark_kernel(10, cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N,
-                                     &alpha, d_B, N, d_A, N, &beta, d_C_v1, N));
+      float cublas_time = benchmark_kernel(10, [&]() {
+        cublasCheck(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N,
+                                &alpha, d_B, N, d_A, N, &beta, d_C_v1, N));
+      });
 
       cudaCheck(cudaMemcpy(C_cublas, d_C_v1, size, cudaMemcpyDeviceToHost));
       cudaCheck(cudaMemset(d_C_v1, 0, size));
       dim3 blockDim(256);
       dim3 gridDim(CEIL_DIV(N, 128), CEIL_DIV(N, 128));
-      float v1_time = benchmark_kernel(10, matmul_v1<128, 128, 8, 8, 8><<<gridDim, blockDim>>>(N, N, N, d_A, d_B, d_C_v1, alpha, beta));
+      float v1_time = benchmark_kernel(10, [&]() {
+        matmul_v1<128, 128, 8, 8, 8>
+            <<<gridDim, blockDim>>>(N, N, N, d_A, d_B, d_C_v1, alpha, beta);
+        cudaCheck(cudaGetLastError());
+      });
 
       // 拷贝手写 kernel 结果
       cudaCheck(cudaMemcpy(C_v1, d_C_v1, size, cudaMemcpyDeviceToHost));
