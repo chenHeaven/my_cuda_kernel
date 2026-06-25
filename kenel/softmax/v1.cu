@@ -1,3 +1,5 @@
+// 处理单行的softmax函数
+
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <algorithm>
